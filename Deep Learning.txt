@@ -1,0 +1,269 @@
+import os
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision.models import resnet18, resnet152, ResNet18_Weights, ResNet152_Weights
+from sklearn.model_selection import StratifiedKFold
+from scipy import stats
+from sklearn.metrics import (
+    accuracy_score, precision_recall_fscore_support, 
+    roc_auc_score, confusion_matrix, balanced_accuracy_score, roc_curve
+)
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Configuración de directorios de salida
+RESULTS_DIR = "New_Results"
+MODEL_DIR = os.path.join(RESULTS_DIR, "Saved_Models")
+PLOTS_DIR = os.path.join(RESULTS_DIR, "Saved_Plots")
+DATA_FOLDER = "Raman_Database"
+
+os.makedirs(MODEL_DIR, exist_ok=True)
+os.makedirs(os.path.join(PLOTS_DIR, "Learning_Curves"), exist_ok=True)
+os.makedirs(os.path.join(PLOTS_DIR, "Confusion_Matrices"), exist_ok=True)
+os.makedirs(os.path.join(PLOTS_DIR, "ROC_Curves"), exist_ok=True)
+
+class RamanDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X[:, np.newaxis, np.newaxis, :], dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.long)
+    def __len__(self):
+        return len(self.X)
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+def get_resnet_model(model_name, num_classes, strategy='scratch'):
+    if model_name == "ResNet-18":
+        weights = ResNet18_Weights.DEFAULT if strategy == 'transfer' else None
+        model = resnet18(weights=weights)
+    elif model_name == "ResNet-152":
+        weights = ResNet152_Weights.DEFAULT if strategy == 'transfer' else None
+        model = resnet152(weights=weights)
+    else:
+        raise ValueError("Arquitectura no soportada")
+    
+    # Ajuste para espectros 1D adaptados a 2D Conv
+    model.conv1 = nn.Conv2d(1, 64, kernel_size=(1, 7), stride=(1, 2), padding=(0, 3), bias=False)
+    
+    # Si es Transfer Learning, congelar capas base
+    if strategy == 'transfer':
+        for param in model.parameters():
+            param.requires_grad = False
+        for param in model.conv1.parameters():
+            param.requires_grad = True
+
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
+    return model
+
+def load_raman_dataset(data_type='Processed'):
+    h_path = os.path.join(DATA_FOLDER, f'{data_type} Healthy.csv')
+    a_path = os.path.join(DATA_FOLDER, f'{data_type} Asymptomatic HLB.csv')
+    s_path = os.path.join(DATA_FOLDER, f'{data_type} Symptomatic HLB.csv')
+    
+    def read_csv(p):
+        df = pd.read_csv(p, header=0, index_col=0).dropna()
+        return df.values.astype(np.float32)
+
+    h, a, s = read_csv(h_path), read_csv(a_path), read_csv(s_path)
+    X = np.vstack([h, a, s])
+    y = np.array([0]*len(h) + [1]*len(a) + [2]*len(s), dtype=np.int64)
+    return X, y
+
+def compute_stats(values, prefix):
+    arr = np.array(values)
+    mean = np.mean(arr)
+    std = np.std(arr, ddof=1) if len(arr) > 1 else 0.0
+    se = std / np.sqrt(len(arr)) if len(arr) > 0 else 0.0
+    ci95 = se * stats.t.ppf(0.975, len(arr) - 1) if len(arr) > 1 else 0.0
+    return {
+        f'{prefix}_Mean': mean,
+        f'{prefix}_Std': std,
+        f'{prefix}_CI95': ci95
+    }
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+datasets = {
+    'Raw': load_raman_dataset('Raw'), 
+    'Processed': load_raman_dataset('Processed')
+}
+architectures = ["ResNet-18", "ResNet-152"]
+strategies = ['scratch', 'transfer']
+class_names = ['Healthy', 'Asymptomatic', 'Symptomatic']
+
+summary_records = []
+
+for data_name, (X_data, y_data) in datasets.items():
+    num_classes = len(np.unique(y_data))
+    
+    for arch in architectures:
+        for strat in strategies:
+            variant_label = f"{arch}_{data_name}_{strat}"
+            print(f"\n--- Procesando y generando gráficos para: {variant_label} ---")
+            
+            fold_metrics = {
+                'Accuracy': [], 'Precision': [], 'Recall': [], 
+                'Specificity': [], 'Balanced_Accuracy': [], 
+                'F1_Score': [], 'AUC_Macro': []
+            }
+            
+            all_variant_true = []
+            all_variant_preds = []
+            all_variant_probs = []
+            
+            # Validación cruzada de 5 folds
+            for fold, (train_idx, val_idx) in enumerate(skf.split(X_data, y_data)):
+                train_loader = DataLoader(RamanDataset(X_data[train_idx], y_data[train_idx]), batch_size=32, shuffle=True)
+                val_loader = DataLoader(RamanDataset(X_data[val_idx], y_data[val_idx]), batch_size=32, shuffle=False)
+                y_true = y_data[val_idx]
+                
+                model = get_resnet_model(arch, num_classes, strategy=strat).to(device)
+                criterion = nn.CrossEntropyLoss()
+                optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=0.0001, weight_decay=1e-4)
+                
+                best_val_loss = float('inf')
+                patience, patience_counter = 15, 0
+                
+                train_losses, val_losses = [], []
+                
+                # Entrenamiento por fold (hasta 100 épocas)
+                for epoch in range(100):
+                    model.train()
+                    running_train_loss = 0.0
+                    for inputs, labels in train_loader:
+                        inputs, labels = inputs.to(device), labels.to(device)
+                        optimizer.zero_grad()
+                        outputs = model(inputs)
+                        loss = criterion(outputs, labels)
+                        loss.backward()
+                        optimizer.step()
+                        running_train_loss += loss.item() * inputs.size(0)
+                    
+                    epoch_train_loss = running_train_loss / len(train_loader.dataset)
+                    train_losses.append(epoch_train_loss)
+                    
+                    # Validación
+                    model.eval()
+                    val_loss = 0.0
+                    with torch.no_grad():
+                        for inputs, labels in val_loader:
+                            inputs, labels = inputs.to(device), labels.to(device)
+                            outputs = model(inputs)
+                            loss = criterion(outputs, labels)
+                            val_loss += loss.item() * inputs.size(0)
+                    epoch_val_loss = val_loss / len(val_loader.dataset)
+                    val_losses.append(epoch_val_loss)
+                    
+                    if epoch_val_loss < best_val_loss:
+                        best_val_loss = epoch_val_loss
+                        patience_counter = 0
+                        torch.save(model.state_dict(), os.path.join(MODEL_DIR, f"{variant_label}_fold{fold}_best.pth"))
+                    else:
+                        patience_counter += 1
+                        if patience_counter >= patience:
+                            break
+                
+                # --- Guardar Learning Curve del fold ---
+                plt.figure(figsize=(8, 5))
+                plt.plot(train_losses, label='Train Loss')
+                plt.plot(val_losses, label='Validation Loss')
+                plt.title(f'Learning Curve - {variant_label} (Fold {fold})')
+                plt.xlabel('Epochs')
+                plt.ylabel('Loss')
+                plt.legend()
+                plt.grid(True, linestyle='--', alpha=0.6)
+                plt.savefig(os.path.join(PLOTS_DIR, "Learning_Curves", f"{variant_label}_fold{fold}_loss.png"), dpi=300)
+                plt.close()
+
+                # Cargar el mejor modelo del fold para evaluación
+                model.load_state_dict(torch.load(os.path.join(MODEL_DIR, f"{variant_label}_fold{fold}_best.pth"), map_location=device))
+                model.eval()
+                
+                fold_preds, fold_probs = [], []
+                softmax = nn.Softmax(dim=1)
+                with torch.no_grad():
+                    for inputs, _ in val_loader:
+                        inputs = inputs.to(device)
+                        outputs = model(inputs)
+                        probs = softmax(outputs)
+                        _, preds = torch.max(outputs, 1)
+                        fold_preds.extend(preds.cpu().numpy())
+                        fold_probs.extend(probs.cpu().numpy())
+
+                fold_preds = np.array(fold_preds)
+                fold_probs = np.array(fold_probs)
+
+                all_variant_true.extend(y_true)
+                all_variant_preds.extend(fold_preds)
+                all_variant_probs.extend(fold_probs)
+
+                # Métricas por fold
+                fold_metrics['Accuracy'].append(accuracy_score(y_true, fold_preds))
+                prec, rec, f1, _ = precision_recall_fscore_support(y_true, fold_preds, average='macro', zero_division=0)
+                fold_metrics['Precision'].append(prec)
+                fold_metrics['Recall'].append(rec)
+                fold_metrics['F1_Score'].append(f1)
+                fold_metrics['Balanced_Accuracy'].append(balanced_accuracy_score(y_true, fold_preds))
+                
+                cm_fold = confusion_matrix(y_true, fold_preds)
+                spec = np.mean([cm_fold[i,i] / (np.sum(cm_fold[i,:]) + 1e-9) for i in range(cm_fold.shape[0])])
+                fold_metrics['Specificity'].append(spec)
+
+                try:
+                    auc_val = roc_auc_score(y_true, fold_probs, multi_class='ovr', average='macro')
+                except:
+                    auc_val = 0.5
+                fold_metrics['AUC_Macro'].append(auc_val)
+
+            # --- Consolidar y Graficar Matriz de Confusión Total de la Variante ---
+            all_variant_true = np.array(all_variant_true)
+            all_variant_preds = np.array(all_variant_preds)
+            all_variant_probs = np.array(all_variant_probs)
+
+            cm_total = confusion_matrix(all_variant_true, all_variant_preds)
+            plt.figure(figsize=(7, 6))
+            sns.heatmap(cm_total, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
+            plt.title(f'Confusion Matrix (OOF) - {variant_label}')
+            plt.xlabel('Predicted Label')
+            plt.ylabel('True Label')
+            plt.tight_layout()
+            plt.savefig(os.path.join(PLOTS_DIR, "Confusion_Matrices", f"{variant_label}_confusion_matrix.png"), dpi=300)
+            plt.close()
+
+            # --- Generar Curva ROC Multiclase (One-vs-Rest) ---
+            plt.figure(figsize=(8, 6))
+            from sklearn.preprocessing import label_binarize
+            y_true_bin = label_binarize(all_variant_true, classes=[0, 1, 2])
+            
+            for i, class_name in enumerate(class_names):
+                fpr, tpr, _ = roc_curve(y_true_bin[:, i], all_variant_probs[:, i])
+                roc_auc = roc_auc_score(y_true_bin[:, i], all_variant_probs[:, i])
+                plt.plot(fpr, tpr, lw=2, label=f'ROC {class_name} (AUC = {roc_auc:.3f})')
+            
+            plt.plot([0, 1], [0, 1], 'k--', lw=2)
+            plt.xlim([0.0, 1.0])
+            plt.ylim([0.0, 1.05])
+            plt.xlabel('False Positive Rate')
+            plt.ylabel('True Positive Rate')
+            plt.title(f'Multiclass ROC Curves - {variant_label}')
+            plt.legend(loc="lower right")
+            plt.grid(True, linestyle='--', alpha=0.6)
+            plt.tight_layout()
+            plt.savefig(os.path.join(PLOTS_DIR, "ROC_Curves", f"{variant_label}_roc_curve.png"), dpi=300)
+            plt.close()
+
+            # Consolidar estadísticas de los folds
+            record = {'Model': variant_label}
+            for metric_name, values in fold_metrics.items():
+                record.update(compute_stats(values, metric_name))
+            summary_records.append(record)
+
+# Guardar CSV final con el resumen de métricas
+output_csv = os.path.join(RESULTS_DIR, "ResNet_All_8_Variants_Performance_Summary.csv")
+pd.DataFrame(summary_records).to_csv(output_csv, index=False)
+print(f"\n¡Entrenamiento completado! Resumen de métricas guardado en {output_csv}")
+print(f"Gráficas guardadas en la carpeta: {PLOTS_DIR}")

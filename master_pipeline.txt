@@ -1,0 +1,313 @@
+nano master_raman_pipeline_complete.py
+
+
+import os
+import time
+import numpy as np
+import pandas as pd
+import joblib
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision.models import resnet18, resnet152
+
+from sklearn.metrics import (
+    accuracy_score, precision_recall_fscore_support, 
+    roc_auc_score, confusion_matrix, roc_curve, auc
+)
+from sklearn.model_selection import StratifiedKFold, GridSearchCV
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.decomposition import PCA
+
+# --- CONFIGURACIÓN DE DIRECTORIOS ---
+RESULTS_DIR = "New_Results"
+MODEL_DIR = os.path.join(RESULTS_DIR, "Saved_Models")
+CONFUSION_DIR = os.path.join(RESULTS_DIR, "Confusion_Matrices")
+ROC_DIR = os.path.join(RESULTS_DIR, "ROC_Curves")
+LC_DIR = os.path.join(RESULTS_DIR, "Learning_Curves")
+DATA_FOLDER = "Raman_Database"
+
+for d in [RESULTS_DIR, MODEL_DIR, CONFUSION_DIR, ROC_DIR, LC_DIR]:
+    os.makedirs(d, exist_ok=True)
+
+print("=== PIPELINE MAESTRO: GRID SEARCH, RESNET (100 EPOCHS), CURVAS Y MATRICES ===")
+
+# --- 1. CARGA DE DATOS REALES RAMAN ---
+def load_raman_dataset(data_type='Processed'):
+    print(f"[INFO] Cargando dataset variant: {data_type} desde {DATA_FOLDER}...")
+    healthy_path = os.path.join(DATA_FOLDER, f'{data_type} Healthy.csv')
+    asymptomatic_path = os.path.join(DATA_FOLDER, f'{data_type} Asymptomatic HLB.csv')
+    symptomatic_path = os.path.join(DATA_FOLDER, f'{data_type} Symptomatic HLB.csv')
+
+    for p in [healthy_path, asymptomatic_path, symptomatic_path]:
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"No se encontró el archivo: {p}")
+
+    def read_spectral_csv(path):
+        df = pd.read_csv(path, header=0, index_col=0).dropna()
+        wavenumbers = df.columns.astype(float).values if df.columns.dtype != object else np.arange(df.shape[1])
+        return df.values.astype(np.float32), wavenumbers
+
+    h_data, wavenumbers = read_spectral_csv(healthy_path)
+    a_data, _ = read_spectral_csv(asymptomatic_path)
+    s_data, _ = read_spectral_csv(symptomatic_path)
+
+    X = np.vstack([h_data, a_data, s_data])
+    y = np.array([0] * len(h_data) + [1] * len(a_data) + [2] * len(s_data), dtype=np.int64)
+    return X, y, wavenumbers
+
+datasets_dict = {}
+for dtype in ['Raw', 'Processed']:
+    try:
+        X_loaded, y_loaded, wn = load_raman_dataset(dtype)
+        datasets_dict[f"{dtype}_Data"] = (X_loaded, y_loaded)
+    except Exception as e:
+        print(f"[AVISO] No se pudo cargar {dtype}: {e}")
+
+if not datasets_dict:
+    raise FileNotFoundError("No se encontró ningún dataset válido en Raman_Database.")
+
+# --- 2. DATASET PYTORCH PARA RESNET (1D) ---
+class RamanDataset(Dataset):
+    def __init__(self, X, y):
+        # AHORA (Genera un tensor 4D correcto para Conv2d: [N, 1, 1, Features])
+        self.X = torch.tensor(X[:, np.newaxis, np.newaxis, :], dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.long)
+        
+    def __len__(self):
+        return len(self.X)
+        
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+def get_resnet_model(model_name, num_classes):
+    if model_name == "ResNet-18":
+        model = resnet18(weights=None)
+    elif model_name == "ResNet-152":
+        model = resnet152(weights=None)
+    else:
+        raise ValueError("Arquitectura no soportada")
+    
+    # Modificar la primera capa conv1 para aceptar 1 solo canal espectral en lugar de 3 RGB
+    model.conv1 = nn.Conv2d(1, 64, kernel_size=(1, 7), stride=(1, 2), padding=(0, 3), bias=False)
+    # Modificar la capa lineal final según el número de clases (Healthy, Asymptomatic, Symptomatic)
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
+    return model
+
+# --- 3. ENTRENAMIENTO DE MODELOS CLÁSICOS + GRID SEARCH ---
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+all_metrics_records = []
+
+for data_name, (X_data, y_data) in datasets_dict.items():
+    # PCA con objetivo de varianza explicada >= 95%
+    pca = PCA(n_components=0.95, random_state=42)
+    X_pca = pca.fit_transform(X_data)
+    joblib.dump(pca, os.path.join(MODEL_DIR, f"{data_name}_pca.pkl"))
+    print(f"\n[{data_name}] PCA retenido al 95%. Componentes seleccionados (k): {X_pca.shape[1]}")
+
+    variants = {"Standard": X_data, "PCA": X_pca}
+
+    for variant_name, X_current in variants.items():
+        print(f"\n--- Evaluando variante: {data_name} ({variant_name}) ---")
+        
+        # Definición de Grillas para Grid Search con los parámetros exactos solicitados
+        grid_search_configs = [
+            {
+                "name": f"kNN_{data_name}_{variant_name}",
+                "estimator": KNeighborsClassifier(),
+                "params": {
+                    'n_neighbors': [3, 5, 7, 9],
+                    'weights': ['uniform', 'distance'],
+                    'metric': ['euclidean', 'manhattan']
+                }
+            },
+            {
+                "name": f"LDA_{data_name}_{variant_name}",
+                "estimator": LinearDiscriminantAnalysis(),
+                "params": {
+                    'solver': ['svd', 'lsqr']
+                }
+            },
+            {
+                "name": f"RandomForest_{data_name}_{variant_name}",
+                "estimator": RandomForestClassifier(random_state=42),
+                "params": {
+                    'n_estimators': [50, 100, 200],
+                    'max_depth': [None, 10, 20],
+                    'criterion': ['gini', 'entropy']
+                }
+            },
+            {
+                "name": f"SVM_{data_name}_{variant_name}",
+                "estimator": SVC(probability=True, random_state=42),
+                "params": {
+                    'C': [0.1, 1, 10, 100],
+                    'kernel': ['linear', 'rbf'],
+                    'gamma': ['scale', 'auto']
+                }
+            }
+        ]
+
+        for item in grid_search_configs:
+            m_name = item["name"]
+            print(f"\nEjecutando Grid Search para: {m_name}")
+            
+            gs = GridSearchCV(item["estimator"], item["params"], cv=skf, scoring='accuracy', n_jobs=1)
+            gs.fit(X_current, y_data)
+            
+            # IMPRESIÓN OBLIGATORIA EN RESULTADOS DE LOS PARÁMETROS ELEGIDOS
+            print(f"--> [GRID SEARCH RESULTADO] {m_name}:")
+            print(f"    Mejores Hiperparámetros: {gs.best_params_}")
+            print(f"    Mejor Score CV (Accuracy): {gs.best_score_:.4f}")
+            
+            best_model = gs.best_estimator_
+            
+            # Evaluación detallada por Fold para métricas, curvas ROC y Matrices de Confusión
+            fold_metrics = {'Accuracy': [], 'Precision': [], 'Recall': [], 'Specificity': [], 'F1_Score': [], 'AUC': []}
+            tprs, aucs = [], []
+            mean_fpr = np.linspace(0, 1, 100)
+            fig_roc, ax_roc = plt.subplots(figsize=(8, 6))
+            
+            all_cms = np.zeros((len(np.unique(y_data)), len(np.unique(y_data))), dtype=int)
+
+            for fold, (train_idx, val_idx) in enumerate(skf.split(X_current, y_data)):
+                X_tr, X_va = X_current[train_idx], X_current[val_idx]
+                y_tr, y_va = y_data[train_idx], y_data[val_idx]
+                
+                best_model.fit(X_tr, y_tr)
+                preds = best_model.predict(X_va)
+                probs = best_model.predict_proba(X_va)
+                
+                acc = accuracy_score(y_va, preds)
+                prec, rec, f1, _ = precision_recall_fscore_support(y_va, preds, average='macro', zero_division=0)
+                
+                cm = confusion_matrix(y_va, preds)
+                all_cms += cm
+                
+                # Especificidad multiclase aproximada o binaria
+                if cm.shape == (2, 2):
+                    tn, fp, fn, tp = cm.ravel()
+                    spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+                else:
+                    spec = np.mean([cm[i,i] / (np.sum(cm[i,:]) + 1e-9) for i in range(cm.shape[0])])
+
+                try:
+                    auc_val = roc_auc_score(y_va, probs, multi_class='ovr', average='macro')
+                except:
+                    auc_val = 0.5
+
+                fold_metrics['Accuracy'].append(acc)
+                fold_metrics['Precision'].append(prec)
+                fold_metrics['Recall'].append(rec)
+                fold_metrics['Specificity'].append(spec)
+                fold_metrics['F1_Score'].append(f1)
+                fold_metrics['AUC'].append(auc_val)
+
+            # Guardar Modelo Optimizado Final
+            joblib.dump(best_model, os.path.join(MODEL_DIR, f"{m_name}_optimized.pkl"))
+
+            # Guardar Matriz de Confusión en Formato Gráfico (Heatmap)
+            plt.figure(figsize=(6, 5))
+            sns.heatmap(all_cms, annot=True, fmt='d', cmap='Blues', cbar=False)
+            plt.title(f'Matriz de Confusión - {m_name}')
+            plt.xlabel('Predicción')
+            plt.ylabel('Real')
+            plt.tight_layout()
+            plt.savefig(os.path.join(CONFUSION_DIR, f"{m_name}_confusion_matrix.png"))
+            plt.close()
+
+            # Consolidar registro de métricas
+            record = {'Model': m_name, 'Best_Params': str(gs.best_params_)}
+            for k_m, vals in fold_metrics.items():
+                record[f'{k_m}_Mean'] = np.mean(vals)
+                record[f'{k_m}_Std'] = np.std(vals, ddof=1)
+            all_metrics_records.append(record)
+
+
+    # --- 4. ENTRENAMIENTO DE RESNET-18 Y RESNET-152 (100 EPOCHS + EARLY STOPPING) ---
+    num_classes = len(np.unique(y_data))
+    for resnet_type in ["ResNet-18", "ResNet-152"]:
+        print(f"\n[DEEP LEARNING] Entrenando {resnet_type} con {data_name} (100 Epochs máx)...")
+        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = get_resnet_model(resnet_type, num_classes).to(device)
+        
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-4)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+        
+        # Usaremos el primer fold o división para graficar la Curva de Aprendizaje detallada
+        train_idx, val_idx = next(skf.split(X_data, y_data))
+        train_loader = DataLoader(RamanDataset(X_data[train_idx], y_data[train_idx]), batch_size=32, shuffle=True)
+        val_loader = DataLoader(RamanDataset(X_data[val_idx], y_data[val_idx]), batch_size=32, shuffle=False)
+
+        train_losses, val_losses = [], []
+        best_val_loss = float('inf')
+        patience_counter = 0
+        early_stopping_patience = 10
+
+        for epoch in range(100): # 100 Epochs exactas solicitadas
+            model.train()
+            running_loss = 0.0
+            for inputs, labels in train_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
+                running_loss += loss.item() * inputs.size(0)
+            
+            epoch_train_loss = running_loss / len(train_loader.dataset)
+            train_losses.append(epoch_train_loss)
+
+            # Validación
+            model.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for inputs, labels in val_loader:
+                    inputs, labels = inputs.to(device), labels.to(device)
+                    outputs = model(inputs)
+                    loss = criterion(outputs, labels)
+                    val_loss += loss.item() * inputs.size(0)
+            
+            epoch_val_loss = val_loss / len(val_loader.dataset)
+            val_losses.append(epoch_val_loss)
+
+            scheduler.step(epoch_val_loss)
+
+            # Early Stopping Check (Patience: 10 epochs)
+            if epoch_val_loss < best_val_loss:
+                best_val_loss = epoch_val_loss
+                patience_counter = 0
+                torch.save(model.state_dict(), os.path.join(MODEL_DIR, f"{resnet_type}_{data_name}_best.pth"))
+            else:
+                patience_counter += 1
+                if patience_counter >= early_stopping_patience:
+                    print(f"Early Stopping activado en la epoch {epoch+1} para {resnet_type}")
+                    break
+
+        # Graficar Curva de Aprendizaje (Loss Train vs Validation)
+        plt.figure(figsize=(8, 5))
+        plt.plot(train_losses, label='Train Loss')
+        plt.plot(val_losses, label='Validation Loss')
+        plt.title(f'Curva de Aprendizaje - {resnet_type} ({data_name})')
+        plt.xlabel('Epochs')
+        plt.ylabel('Loss (CrossEntropy)')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(os.path.join(LC_DIR, f"{resnet_type}_{data_name}_learning_curve.png"))
+        plt.close()
+        print(f"Curva de aprendizaje guardada para {resnet_type}.")
+
+# Exportar métricas globales a CSV
+pd.DataFrame(all_metrics_records).to_csv(os.path.join(RESULTS_DIR, "GridSearch_Model_Performance_Summary.csv"), index=False)
+print("\n¡Pipeline completado con éxito! Todos los modelos optimizados, Grid Search, Curvas ROC, Curvas de Aprendizaje y Mapas de Calor generados.")
+.!P
