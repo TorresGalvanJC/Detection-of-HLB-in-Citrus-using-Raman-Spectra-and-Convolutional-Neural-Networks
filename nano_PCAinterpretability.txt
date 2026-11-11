@@ -1,0 +1,279 @@
+import os
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from sklearn.decomposition import PCA
+
+# --- 1. CARGA DE DATOS DESDE ARCHIVOS CSV ---
+DATA_DIR = 'Raman_Database'
+
+raw_files = {
+    'Control': 'Raw Healthy.csv',
+    'Asymptomatic': 'Raw Asymptomatic HLB.csv',
+    'Symptomatic': 'Raw Symptomatic HLB.csv',
+}
+
+proc_files = {
+    'Control': 'Processed Healthy.csv',
+    'Asymptomatic': 'Processed Asymptomatic HLB.csv',
+    'Symptomatic': 'Processed Symptomatic HLB.csv',
+}
+
+
+def load_dataset(file_dict):
+  X_list = []
+  y_list = []
+
+  for label, filename in file_dict.items():
+    filepath = os.path.join(DATA_DIR, filename)
+    df = pd.read_csv(filepath, low_memory=False)
+    df_clean = df.apply(pd.to_numeric, errors='coerce')
+    df_clean = df_clean.dropna(how='all', axis=0).dropna(how='all', axis=1)
+
+    data = df_clean.values
+
+    if data.shape[0] > data.shape[1]:
+      data = data.T
+
+    X_list.append(data)
+    y_list.extend([label] * data.shape[0])
+
+  target_channels = min(x.shape[1] for x in X_list)
+  X_aligned = [x[:, :target_channels] for x in X_list]
+
+  X = np.vstack(X_aligned)
+  y = np.array(y_list)
+  return X, y
+
+
+# Cargar matrices
+X_raw, y_raw = load_dataset(raw_files)
+X_proc, y_proc = load_dataset(proc_files)
+
+# Configuración de paleta de colores
+colors = {
+    'Control': '#1f77b4',  # Azul
+    'Asymptomatic': '#d62728',  # Rojo
+    'Symptomatic': '#2ca02c',  # Verde
+}
+classes = ['Control', 'Asymptomatic', 'Symptomatic']
+
+output_dir = 'Results_DL_Publication_v2'
+os.makedirs(output_dir, exist_ok=True)
+
+# Ejes de números de onda
+wn_raw = np.linspace(400, 2300, X_raw.shape[1])
+wn_proc = np.linspace(400, 2300, X_proc.shape[1])
+
+# Configuración global de fuentes
+plt.rcParams.update({
+    'font.size': 12,
+    'axes.labelsize': 14,
+    'axes.titlesize': 16,
+    'xtick.labelsize': 12,
+    'ytick.labelsize': 12,
+    'legend.fontsize': 11,
+})
+
+# ==============================================================================
+# 1. FIGURA 1: SCORES PLOT (Raw vs Processed)
+# ==============================================================================
+fig1, axes1 = plt.subplots(1, 2, figsize=(16, 6), dpi=300)
+
+datasets = [
+    ('Raw Raman Spectra', X_raw, y_raw, axes1[0]),
+    ('Processed Raman Spectra', X_proc, y_proc, axes1[1]),
+]
+
+for title, X_data, y_labels, ax in datasets:
+  pca = PCA(n_components=2)
+  X_pca = pca.fit_transform(X_data)
+  var_exp = pca.explained_variance_ratio_ * 100
+
+  for c in classes:
+    idx = y_labels == c
+    ax.scatter(
+        X_pca[idx, 0],
+        X_pca[idx, 1],
+        label=c,
+        color=colors[c],
+        alpha=0.7,
+        edgecolors='k',
+        linewidths=0.5,
+        s=50,
+    )
+
+  ax.set_xlabel(f'Principal Component 1 ({var_exp[0]:.2f}% Variance)')
+  ax.set_ylabel(f'Principal Component 2 ({var_exp[1]:.2f}% Variance)')
+  ax.set_title(
+      f'{title}\nTotal Explained Variance (PC1 + PC2):'
+      f' {var_exp[0]+var_exp[1]:.2f}%'
+  )
+
+  ax.axhline(0, color='gray', linestyle='--', linewidth=1.0)
+  ax.axvline(0, color='gray', linestyle='--', linewidth=1.0)
+  ax.legend(title='Class', loc='best')
+  ax.grid(True, linestyle=':', alpha=0.6)
+
+plt.tight_layout()
+output_path1 = os.path.join(output_dir, 'pca_raw_vs_processed_scores.png')
+plt.savefig(output_path1, dpi=300, bbox_inches='tight')
+plt.close()
+print(f'Gráfica de Scores guardada en: {output_path1}')
+
+# ==============================================================================
+# 2. FIGURA 2: PCA LOADINGS CON ALTURA Y OFFSET AJUSTADOS
+# ==============================================================================
+# Se incrementa el tamaño vertical (18 de altura) para dar espacio a la amplitud
+fig2, axes2 = plt.subplots(2, 1, figsize=(15, 18), dpi=300)
+
+offset_step = 0.12  # Step optimizado para evitar compresión visual del eje Y
+
+# ------------------------------------------------------------------------------
+# Subplot A: Raw Loadings
+# ------------------------------------------------------------------------------
+pca_raw = PCA(n_components=2).fit(X_raw)
+var_raw = pca_raw.explained_variance_ratio_ * 100
+
+ax_a = axes2[0]
+current_offset = 0
+
+# Global
+ax_a.plot(
+    wn_raw,
+    pca_raw.components_[0] + current_offset,
+    color='black',
+    linestyle='-',
+    linewidth=3.0,
+    label=f'Global PC1 ({var_raw[0]:.2f}% Var)',
+)
+current_offset += offset_step
+
+ax_a.plot(
+    wn_raw,
+    pca_raw.components_[1] + current_offset,
+    color='black',
+    linestyle='--',
+    linewidth=3.0,
+    label=f'Global PC2 ({var_raw[1]:.2f}% Var)',
+)
+current_offset += offset_step
+
+# Por Categoría
+for c in classes:
+  idx = y_raw == c
+  pca_cat = PCA(n_components=2).fit(X_raw[idx])
+  var_cat = pca_cat.explained_variance_ratio_ * 100
+
+  ax_a.plot(
+      wn_raw,
+      pca_cat.components_[0] + current_offset,
+      color=colors[c],
+      linestyle='-',
+      linewidth=3.6,
+      label=f'{c} PC1 ({var_cat[0]:.1f}% Var)',
+  )
+  current_offset += offset_step
+
+  ax_a.plot(
+      wn_raw,
+      pca_cat.components_[1] + current_offset,
+      color=colors[c],
+      linestyle='--',
+      linewidth=3.0,
+      alpha=0.85,
+      label=f'{c} PC2 ({var_cat[1]:.1f}% Var)',
+  )
+  current_offset += offset_step
+
+ax_a.set_title('a) PCA Loadings - Raw Raman Spectra')
+ax_a.set_ylabel('Loading Weight (+ Offset)')
+ax_a.grid(True, linestyle=':', alpha=0.6)
+
+# Leyenda externa alineada a la derecha
+ax_a.legend(
+    bbox_to_anchor=(1.02, 0.5),
+    loc='center left',
+    borderaxespad=0.0,
+    frameon=True,
+    framealpha=0.9,
+    ncol=1,
+)
+
+# ------------------------------------------------------------------------------
+# Subplot B: Processed Loadings
+# ------------------------------------------------------------------------------
+pca_proc = PCA(n_components=2).fit(X_proc)
+var_proc = pca_proc.explained_variance_ratio_ * 100
+
+ax_b = axes2[1]
+current_offset = 0
+
+# Global
+ax_b.plot(
+    wn_proc,
+    pca_proc.components_[0] + current_offset,
+    color='black',
+    linestyle='-',
+    linewidth=3.0,
+    label=f'Global PC1 ({var_proc[0]:.2f}% Var)',
+)
+current_offset += offset_step
+
+ax_b.plot(
+    wn_proc,
+    pca_proc.components_[1] + current_offset,
+    color='black',
+    linestyle='--',
+    linewidth=3.0,
+    label=f'Global PC2 ({var_proc[1]:.2f}% Var)',
+)
+current_offset += offset_step
+
+# Por Categoría
+for c in classes:
+  idx = y_proc == c
+  pca_cat = PCA(n_components=2).fit(X_proc[idx])
+  var_cat = pca_cat.explained_variance_ratio_ * 100
+
+  ax_b.plot(
+      wn_proc,
+      pca_cat.components_[0] + current_offset,
+      color=colors[c],
+      linestyle='-',
+      linewidth=3.6,
+      label=f'{c} PC1 ({var_cat[0]:.1f}% Var)',
+  )
+  current_offset += offset_step
+
+  ax_b.plot(
+      wn_proc,
+      pca_cat.components_[1] + current_offset,
+      color=colors[c],
+      linestyle='--',
+      linewidth=3.0,
+      alpha=0.85,
+      label=f'{c} PC2 ({var_cat[1]:.1f}% Var)',
+  )
+  current_offset += offset_step
+
+ax_b.set_title('b) PCA Loadings - Processed Raman Spectra')
+ax_b.set_xlabel('Wavelength (cm^-1)')
+ax_b.set_ylabel('Loading Weight (+ Offset)')
+ax_b.grid(True, linestyle=':', alpha=0.6)
+
+# Leyenda externa alineada a la derecha
+ax_b.legend(
+    bbox_to_anchor=(1.02, 0.5),
+    loc='center left',
+    borderaxespad=0.0,
+    frameon=True,
+    framealpha=0.9,
+    ncol=1,
+)
+
+plt.tight_layout()
+output_path2 = os.path.join(output_dir, 'pca_loadings_by_category.png')
+plt.savefig(output_path2, dpi=300, bbox_inches='tight')
+plt.close()
+print(f'Gráfica de Loadings guardada en: {output_path2}')

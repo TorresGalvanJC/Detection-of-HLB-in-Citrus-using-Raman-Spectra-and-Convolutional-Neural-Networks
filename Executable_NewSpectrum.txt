@@ -1,0 +1,26 @@
+import torch
+from run_dl_models import ResNet18_1D
+
+# 1. Instanciar el modelo con la misma arquitectura
+model = ResNet18_1D(num_classes=3)
+
+# 2. Cargar el checkpoint que guardaste
+checkpoint = torch.load(
+    'Results_DL/ResNet18_Base_best.pth', map_location='cpu'
+)
+model.load_state_dict(checkpoint['state_dict'])  # Cargar los pesos entrenados
+model.eval()
+
+# 3. Predecir un espectro nuevo
+# x_nuevo debe tener forma (1, 1, 1901)
+with torch.no_grad():
+  logits = model(x_nuevo)
+  probs = torch.softmax(logits, dim=1)
+  clase_predicha = torch.argmax(probs, dim=1).item()
+
+# Mapeo a las clases oficiales de tu paper:
+classes = ['Control', 'Asymptomatic', 'Symptomatic']
+print(
+    f'Predicción: {classes[clase_predicha]} con una probabilidad del'
+    f' {probs[0][clase_predicha]*100:.2f}%'
+)
